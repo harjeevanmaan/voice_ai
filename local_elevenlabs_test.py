@@ -6,6 +6,8 @@ from pydub import AudioSegment
 from typing import AsyncGenerator, Optional
 import config as app_configs
 import audioop
+from aiohttp.payload import AsyncIterablePayload
+
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -72,11 +74,13 @@ async def generate_s16le_chunks_from_mulaw() -> AsyncGenerator[bytes, None]:
         with open(INTERMEDIATE_PCM_FILE_PATH, "wb") as f_intermediate:
             f_intermediate.write(pcm16_16k)
 
+        pcm16_16k = audioop.mul(pcm16_16k, 2, 4.0)     # +12 dB gain
         # --- 5. Yield 20 ms (640-byte) chunks in “real time” ---
         for i in range(0, len(pcm16_16k), BYTES_PER_CHUNK):
             chunk = pcm16_16k[i : i + BYTES_PER_CHUNK]
             if not chunk:
                 break
+            logger.info(f"Yielding chunk {i} of {len(pcm16_16k)} bytes")
             yield chunk
             await asyncio.sleep(CHUNK_DURATION_MS / 1000.0)  # simulate live feed
         logger.info("Finished yielding all converted s16le PCM chunks.")
@@ -97,12 +101,12 @@ async def run_elevenlabs_streaming_test() -> bool:
         "optimize_streaming_latency": EL_OPTIMIZE_LATENCY_QUERY_PARAM
     }
 
-    s16le_chunk_generator = generate_s16le_chunks_from_mulaw()
+    # s16le_chunk_generator = generate_s16le_chunks_from_mulaw()
 
     form_data = aiohttp.FormData()
     form_data.add_field(
         name='audio',
-        value=s16le_chunk_generator,
+        value=AsyncIterablePayload(generate_s16le_chunks_from_mulaw()),
         filename='audio.pcm',
         content_type='application/octet-stream'
     )
@@ -115,6 +119,7 @@ async def run_elevenlabs_streaming_test() -> bool:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, params=query_params, data=form_data) as response:
+                print(f"Type of response from session.post: {type(response)}")
                 logger.info(f"ElevenLabs response status: {response.status}")
                 if response.status == 200:
                     received_bytes = 0
@@ -124,6 +129,7 @@ async def run_elevenlabs_streaming_test() -> bool:
                             if chunk:
                                 f_out.write(chunk)
                                 received_bytes += len(chunk)
+                                logger.info(f"Received {received_bytes} bytes from ElevenLabs.")
                     logger.info(f"Successfully received {received_bytes} bytes from ElevenLabs.")
                     logger.info(f"Output saved to: {OUTPUT_EL_PCM_FILE}")
                     return True
