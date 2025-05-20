@@ -59,6 +59,22 @@ async def wav_chunk_generator(path: Path):
             yield frame
             await asyncio.sleep(CHUNK_MS / 1000)
 
+# ---------------------------------------------------------------------------#
+#  NEW: standalone coroutine that writes ElevenLabs' streamed response to disk
+# ---------------------------------------------------------------------------#
+async def _recv_and_save(resp: aiohttp.ClientResponse, out_path: Path) -> None:
+    """
+    Read chunks from `resp.content` (ulaw_8000) and append them to `out_path`.
+    Runs independently of the upload coroutine.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    received = 0
+    with out_path.open("wb") as out:
+        async for chunk in resp.content.iter_chunked(4096):
+            out.write(chunk)
+            received += len(chunk)
+    log.info("✓ wrote %d B ElevenLabs output → %s", received, out_path)
+
 # ------------ main -----------------------------------------------------------
 async def run():
     if not API_KEY:
@@ -85,12 +101,12 @@ async def run():
             if r.status != 200:
                 log.error(await r.text())
                 return
-            received = 0
-            with OUT_PCM.open("wb") as out:
-                async for chunk in r.content.iter_chunked(4096):
-                    out.write(chunk)
-                    received += len(chunk)
-            log.info("✓ wrote %d B ElevenLabs output → %s", received, OUT_PCM)
+
+            # launch the response-processing coroutine in parallel
+            recv_task = asyncio.create_task(_recv_and_save(r, OUT_PCM))
+
+            # await completion of the response task before leaving the context
+            await recv_task
 
 if __name__ == "__main__":
     asyncio.run(run()) 
