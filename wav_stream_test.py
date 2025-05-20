@@ -11,6 +11,7 @@ Play result:
 import asyncio, aiohttp, struct, os, logging, config as cfg
 from pathlib import Path
 from aiohttp.payload import AsyncIterablePayload
+from typing import AsyncIterator
 
 INPUT_ULAW = Path("sound_files/sample_8khz_mono_TRUE_RAW_clipped.ulaw")  # raw µ-law 8 kHz
 OUT_PCM    = Path("sound_files/el_output_wav_stream.pcm")
@@ -48,16 +49,36 @@ def mulaw_wav_header_unknown() -> bytes:
         UNKNOWN             # Subchunk2Size (unknown length)
     )
 
-async def wav_chunk_generator(path: Path):
+# ---------------------------------------------------------------------------#
+#  Queue-based producer/consumer pair (upload side)
+# ---------------------------------------------------------------------------#
+async def _producer_read_file(path: Path, q: asyncio.Queue[bytes]) -> None:
     """
-    Yield µ-law WAV header once, then 160-byte (20 ms) µ-law frames in real time.
+    Read the raw µ-law file and push:
+        • one WAV header   (sentinel length = unknown)
+        • 160-byte frames every 20 ms
+    A final `None` sentinel marks EOF.
     """
-    yield mulaw_wav_header_unknown()
+    await q.put(mulaw_wav_header_unknown())
 
     with path.open("rb") as f:
-        while (frame := f.read(160)):          # 160 B = 20 ms μ-law @8 kHz
-            yield frame
+        while (frame := f.read(160)):
+            await q.put(frame)
             await asyncio.sleep(CHUNK_MS / 1000)
+
+    await q.put(None)                      # tell consumer we're done
+
+
+async def _queue_iterator(q: asyncio.Queue[bytes]) -> AsyncIterator[bytes]:
+    """
+    Async-generator consumed by `AsyncIterablePayload`.
+    """
+    while True:
+        chunk = await q.get()
+        if chunk is None:                  # EOF sentinel
+            break
+        yield chunk
+        q.task_done()
 
 # ---------------------------------------------------------------------------#
 #  NEW: standalone coroutine that writes ElevenLabs' streamed response to disk
@@ -84,10 +105,14 @@ async def run():
     params  = {"output_format": "ulaw_8000", "optimize_streaming_latency": 0}
     headers = {"Xi-Api-Key": API_KEY}
 
+    # ---------------- upload queue & tasks ----------------
+    upload_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+    producer_task = asyncio.create_task(_producer_read_file(INPUT_ULAW, upload_q))
+
     form = aiohttp.FormData()
     form.add_field(
         "audio",
-        AsyncIterablePayload(wav_chunk_generator(INPUT_ULAW)),
+        AsyncIterablePayload(_queue_iterator(upload_q)),
         filename="audio.wav",
         content_type="audio/wav"          # still a WAV container
     )
@@ -102,11 +127,12 @@ async def run():
                 log.error(await r.text())
                 return
 
-            # launch the response-processing coroutine in parallel
+            # launch download-side coroutine
             recv_task = asyncio.create_task(_recv_and_save(r, OUT_PCM))
 
-            # await completion of the response task before leaving the context
-            await recv_task
+            # wait for both producer (upload) and downloader to finish
+            await asyncio.gather(producer_task, recv_task)
 
 if __name__ == "__main__":
+    print(f"Voice ID: {VOICE_ID}")
     asyncio.run(run()) 
