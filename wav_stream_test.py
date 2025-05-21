@@ -13,7 +13,8 @@ from pathlib import Path
 from aiohttp.payload import AsyncIterablePayload
 from typing import AsyncIterator
 
-INPUT_ULAW = Path("sound_files/sample_8khz_mono_TRUE_RAW_clipped.ulaw")  # raw µ-law 8 kHz
+# INPUT_ULAW = Path("sound_files/sample_8khz_mono_TRUE_RAW_clipped.ulaw")  # raw µ-law 8 kHz
+INPUT_ULAW = Path("twilio_ulaw_8k.pcm")  # raw µ-law 8 kHz
 OUT_PCM    = Path("sound_files/el_output_wav_stream.pcm")
 VOICE_ID   = cfg.ELEVENLABS_VOICE_ID or "XXhALD8N7SAICWXSC1Km"
 MODEL_ID   = cfg.ELEVENLABS_MODEL_ID  or "eleven_multilingual_sts_v2"
