@@ -9,10 +9,13 @@ import asyncio, websockets, json, base64, logging, pathlib, datetime, aiohttp, s
 from aiohttp.payload import AsyncIterablePayload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-INBOUND_QUEUE = asyncio.Queue(maxsize=400)          # Twilio → EL
+INBOUND_QUEUE = asyncio.Queue(maxsize=40000)          # Twilio → EL
 WS_HANDLE: websockets.WebSocketServerProtocol | None = None
 STREAM_SID = ""                                    # filled on "start"
 SENTINEL   = b""
+
+# 300 ms bucket: 15 frames × 160 B  (Twilio sends 20 ms per frame)
+CHUNK_FRAMES = 90
 
 # --- ElevenLabs settings (env-driven; fall back to hard-coded IDs) -----------
 VOICE_ID = cfg.ELEVENLABS_VOICE_ID or "XXhALD8N7SAICWXSC1Km"
@@ -38,6 +41,7 @@ def mulaw_wav_header_unknown() -> bytes:
         b"fmt ", 16, 7, 1, 8000, byte_rate, block_align, 8,
         b"data", UNKNOWN
     )
+
 # ------------------------------------------------------------------ WebSocket
 """
 This is the main coroutine that handles the WebSocket connection. Responsible for receiving Twilio JSON messages, parsing them, and placing audio frames
@@ -75,50 +79,46 @@ async def _elevenlabs_upload():
         return
 
     url     = f"https://api.elevenlabs.io/v1/speech-to-speech/{VOICE_ID}/stream"
-    params  = {
-        "output_format":            "ulaw_8000",
-        "optimize_streaming_latency": 4,        # 4 = lowest latency
-        "simulate_vad":             "false"     # don't wait for pauses
-    }
+    params  = {"output_format": "ulaw_8000", "optimize_streaming_latency": 0}
     headers = {"Xi-Api-Key": API_KEY}
 
-    form = aiohttp.FormData()
-    form.add_field(
-        "audio",
-        AsyncIterablePayload(_body_generator()),
-        filename="audio.wav",
-        content_type="audio/wav"                # still a WAV container
-    )
-    form.add_field("model_id", MODEL_ID)
-
-    logging.info("POST %s …", url)
     async with aiohttp.ClientSession() as s:
-        async with s.post(url, params=params, data=form, headers=headers) as r:
-            logging.info("ElevenLabs status %s", r.status)
+        iteration = 1
+        while (blob := await _collect_chunk()):
+            form = aiohttp.FormData()
+            form.add_field("audio", blob,
+                           filename="chunk.wav",
+                           content_type="audio/wav")
+            form.add_field("model_id", MODEL_ID)
+
+            logging.info("POST %d B chunk → EL  (iteration %d)", len(blob), iteration)
+            r = await s.post(url, params=params, data=form, headers=headers)
             if r.status != 200:
-                logging.error(await r.text())
-                return
-            await _recv_and_forward(r)             # stream → disk
+                logging.error("EL %s %s", r.status, await r.text())
+                continue
+            # relay reply now; next chunk waits until this one finishes
+            await _recv_and_forward(r, iteration)
+            iteration += 1
 
 # ------------------------------------------------------------------ NEW: body-generator sent to ElevenLabs
 """
 Asyncronously iterates over the queue and yields ulaw frames as they arrive.
 """
-async def _body_generator():
-    """Async-iterable that yields one WAV header then live 160-B μ-law frames."""
-    yield mulaw_wav_header_unknown()            # header first
-    while True:
-        frame = await INBOUND_QUEUE.get()
-        if frame is SENTINEL:                   # poison pill → EOF
-            break
-        yield frame
-        INBOUND_QUEUE.task_done()
+# async def _body_generator():
+#     """Async-iterable that yields one WAV header then live 160-B μ-law frames."""
+#     yield mulaw_wav_header_unknown()            # header first
+#     while True:
+#         frame = await INBOUND_QUEUE.get()
+#         if frame is SENTINEL:                   # poison pill → EOF
+#             break
+#         yield frame
+#         INBOUND_QUEUE.task_done()
 
 # ------------------------------------------------------------------ EL reply reader
 """
 Coroutine to handle asyncronous receiving of transformed audio, from ElevenLabs. Currently saves a local copy and relays it back to Twilio over the websocket.
 """
-async def _recv_and_forward(resp: aiohttp.ClientResponse):
+async def _recv_and_forward(resp: aiohttp.ClientResponse, iteration: int = 0):
     """Mirror EL reply back to Twilio *and* save a local copy."""
     OUT_PCM.parent.mkdir(parents=True, exist_ok=True)
     buf, written = bytearray(), 0
@@ -133,6 +133,8 @@ async def _recv_and_forward(resp: aiohttp.ClientResponse):
                 logging.info("Inside _recv_and_forward: Sending frame to Twilio")
                 await _send_frame_to_twilio(frame)
     logging.info("✓ relayed %d B ElevenLabs → Twilio & %s", written, OUT_PCM)
+    logging.info("Completed iteration %d", iteration)
+
 # ------------------------------------------------------------------ NEW: save ElevenLabs streaming reply
 # async def _recv_and_save(resp: aiohttp.ClientResponse):
 #     OUT_PCM.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +177,20 @@ async def main():
     async with websockets.serve(media_handler, "", 8765):
         logging.info("🌐 WebSocket listening on ws://localhost:8765")
         await _elevenlabs_upload()               # returns when call ends
+
+# ------------------------------------------------------------------ helper
+async def _collect_chunk() -> bytes | None:
+    """
+    Pull ≤15 frames from the queue, prepend WAV header.
+    Return bytes to upload, or None when stream is over.
+    """
+    buf = bytearray(mulaw_wav_header_unknown())
+    for _ in range(CHUNK_FRAMES):
+        frame = await INBOUND_QUEUE.get()
+        if frame is SENTINEL:
+            return None if len(buf) == 44 else bytes(buf)
+        buf += frame
+    return bytes(buf)
 
 if __name__ == "__main__":
     try:
